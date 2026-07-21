@@ -124,9 +124,14 @@ function setConn(text, state) {
   connState.textContent = text;
   dot.className = 'dot' + (recording ? ' rec' : (state ? ' ' + state : ''));
 }
-function sendText(text) {
+let seq = 0;      // monotonic message counter (viewer discards stale updates)
+let segId = 0;    // id of the current utterance (partials share it; final closes it)
+const INTERIM_MS = 2000;   // how often to push a live (mid-speech) translation
+let lastInterimText = '';
+let lastInterimSent = 0;
+function sendMsg(text, isFinal) {
   if (wsOpen && ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'text', text }));
+    ws.send(JSON.stringify({ type: 'text', text, isFinal, id: segId, seq: seq++ }));
   }
 }
 function addSegment(text) {
@@ -164,12 +169,27 @@ function buildRecognition() {
       const txt = r[0].transcript;
       if (r.isFinal) {
         const clean = txt.trim();
-        if (clean) { addSegment(clean); sendText(clean); }
+        if (clean) {
+          addSegment(clean);       // lock it in the speaker's own transcript
+          sendMsg(clean, true);    // final -> viewers lock this line
+          segId++;                 // next utterance gets a fresh id
+          lastInterimText = ''; lastInterimSent = 0;
+        }
       } else {
         interim += txt;
       }
     }
     interimEl.textContent = interim;
+
+    // Live translation mid-speech: send the growing interim text ~every 2s,
+    // even without pausing. Viewers update the same line and it self-corrects.
+    const clean = interim.trim();
+    const now = Date.now();
+    if (clean && clean !== lastInterimText && now - lastInterimSent >= INTERIM_MS) {
+      lastInterimText = clean;
+      lastInterimSent = now;
+      sendMsg(clean, false);
+    }
   };
   rec.onerror = (e) => {
     if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
