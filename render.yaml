@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: speech-translate
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: SOURCE_LANG
+        value: he
+      # Runs free with no API key. To upgrade translation quality, add e.g.:
+      # - key: TRANSLATION_ENGINE
+      #   value: openai
+      # - key: OPENAI_API_KEY
+      #   sync: false
