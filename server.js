@@ -106,6 +106,7 @@ function createSession() {
     viewers: new Set(),
     createdAt: Date.now(),
     lastActivity: Date.now(),
+    recentFinals: [], // last few finished Hebrew sentences, for rolling context
   });
   return { sessionId, token };
 }
@@ -148,7 +149,12 @@ async function translateMyMemory(text, targetCode) {
 }
 
 // Quality engine: context-aware translation via Claude (fast Haiku model).
-async function translateClaude(text, targetName) {
+// `context` = the previous Hebrew sentence(s), used only to keep terminology and
+// pronouns consistent across the talk — not translated.
+async function translateClaude(text, targetName, context) {
+  const userContent = context
+    ? `Prior sentences (context only — do NOT translate these):\n${context}\n\nSentence to translate:\n${text}`
+    : text;
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -161,11 +167,12 @@ async function translateClaude(text, targetName) {
       max_tokens: 512,
       system:
         `You are a professional simultaneous interpreter at a company event. Context: ${TALK_CONTEXT}\n` +
-        `Translate the Hebrew the user sends into ${targetName}. ` +
+        `Translate the Hebrew into ${targetName}. If the message includes "Prior sentences (context only...)", ` +
+        `use them ONLY to keep terminology, names, and pronouns consistent — translate ONLY the text under "Sentence to translate". ` +
         `Output ONLY the translation — no notes, no quotes, no transliteration, no explanation. ` +
         `Keep the company names ATM and Steerlinq unchanged. Preserve names, numbers, and tone, ` +
         `and use natural ${targetName} suited to employees hearing their CEO.`,
-      messages: [{ role: 'user', content: text }],
+      messages: [{ role: 'user', content: userContent }],
     }),
   });
   if (!res.ok) throw new Error(`claude ${res.status}`);
@@ -174,7 +181,10 @@ async function translateClaude(text, targetName) {
   return (block?.text || '').trim();
 }
 
-async function translateOpenAI(text, targetName) {
+async function translateOpenAI(text, targetName, context) {
+  const userContent = context
+    ? `Prior sentences (context only — do NOT translate these):\n${context}\n\nSentence to translate:\n${text}`
+    : text;
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
@@ -185,10 +195,12 @@ async function translateOpenAI(text, targetName) {
         {
           role: 'system',
           content:
-            `You are a professional simultaneous interpreter. Translate the user's text into ${targetName}. ` +
-            `Output ONLY the translation, no quotes, no notes. Preserve meaning, tone, names, and numbers.`,
+            `You are a professional simultaneous interpreter at a company event. Context: ${TALK_CONTEXT}\n` +
+            `Translate the Hebrew into ${targetName}. If the message includes prior context lines, use them only ` +
+            `to keep terminology and pronouns consistent — translate ONLY the "Sentence to translate". ` +
+            `Output ONLY the translation, no quotes, no notes. Keep ATM and Steerlinq unchanged. Preserve meaning, tone, names, and numbers.`,
         },
-        { role: 'user', content: text },
+        { role: 'user', content: userContent },
       ],
     }),
   });
@@ -254,18 +266,19 @@ async function translateFree(text, langCode) {
 
 // isFinal=true uses the paid quality engine (if configured); live partials stay on the
 // fast free engine. So the mid-speech preview is quick, and the locked line is polished.
-async function translate(text, langCode, isFinal) {
+async function translate(text, langCode, isFinal, context) {
   if (langCode === SOURCE_LANG) return text; // no translation needed
   const engine = premiumEngine();
   const usePremium = isFinal && !!engine;
-  const key = `${usePremium ? 'q' : 'f'}:${langCode}::${text}`;
+  // Context only affects premium finals; keep it out of the free-path cache key.
+  const key = `${usePremium ? 'q' : 'f'}:${langCode}::${usePremium && context ? context + '|' : ''}${text}`;
   if (translateCache.has(key)) return translateCache.get(key);
 
   const name = LANGUAGES[langCode] || langCode;
   let out;
   try {
-    if (usePremium && engine === 'claude') out = await translateClaude(text, name);
-    else if (usePremium && engine === 'openai') out = await translateOpenAI(text, name);
+    if (usePremium && engine === 'claude') out = await translateClaude(text, name, context);
+    else if (usePremium && engine === 'openai') out = await translateOpenAI(text, name, context);
     else if (usePremium && engine === 'deepl') out = await translateDeepL(text, langCode);
     else out = await translateFree(text, langCode);
   } catch (e) {
@@ -302,12 +315,21 @@ async function handleText(session, msg) {
   for (const v of session.viewers) if (v.lang) wanted.add(v.lang);
   if (wanted.size === 0) return; // nobody watching
 
+  // Rolling context: the previous finished sentence(s), for consistency on premium finals.
+  const context = isFinal ? (session.recentFinals || []).join(' ') : '';
+
   const translations = {};
   await Promise.all(
     [...wanted].map(async (lang) => {
-      translations[lang] = await translate(hebrew, lang, isFinal);
+      translations[lang] = await translate(hebrew, lang, isFinal, context);
     })
   );
+
+  // Remember this finished sentence for the next one's context (keep last 2).
+  if (isFinal) {
+    session.recentFinals.push(hebrew);
+    if (session.recentFinals.length > 2) session.recentFinals.shift();
+  }
 
   const type = isFinal ? 'segment' : 'partial';
   for (const v of session.viewers) {
