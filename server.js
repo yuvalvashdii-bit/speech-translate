@@ -184,17 +184,18 @@ async function translate(text, langCode) {
 }
 
 // ------------------------- Handle a recognized Hebrew segment -------------------------
-async function handleText(session, hebrew, speakerWs) {
-  hebrew = (hebrew || '').trim();
+// msg = { text, isFinal, id, seq }
+//   isFinal=false -> live partial (mid-speech), viewers update the SAME line by id.
+//   isFinal=true  -> the sentence is done; viewers lock that line.
+async function handleText(session, msg) {
+  const hebrew = (msg.text || '').trim();
   if (hebrew.length < 1) return;
 
-  session.lastActivity = Date.now();
-  const ts = Date.now();
+  const isFinal = !!msg.isFinal;
+  const id = msg.id ?? 0;
+  const seq = msg.seq ?? 0;
 
-  // Echo the source text back to the speaker's own screen.
-  if (speakerWs && speakerWs.readyState === speakerWs.OPEN) {
-    speakerWs.send(JSON.stringify({ type: 'source', ts, text: hebrew }));
-  }
+  session.lastActivity = Date.now();
 
   // Distinct languages currently requested by viewers.
   const wanted = new Set();
@@ -208,11 +209,12 @@ async function handleText(session, hebrew, speakerWs) {
     })
   );
 
+  const type = isFinal ? 'segment' : 'partial';
   for (const v of session.viewers) {
     if (v.readyState !== v.OPEN) continue;
     const text = translations[v.lang];
     if (text == null) continue;
-    v.send(JSON.stringify({ type: 'segment', ts, source: hebrew, text, lang: v.lang }));
+    v.send(JSON.stringify({ type, id, seq, source: hebrew, text, lang: v.lang }));
   }
 }
 
@@ -268,7 +270,7 @@ wss.on('connection', (ws, req, url) => {
     ws.on('message', (data) => {
       try {
         const msg = JSON.parse(data.toString());
-        if (msg.type === 'text') handleText(session, msg.text, ws);
+        if (msg.type === 'text') handleText(session, msg);
       } catch {}
     });
   } else if (p === '/ws/watch') {
