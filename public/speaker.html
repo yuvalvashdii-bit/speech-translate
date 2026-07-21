@@ -1,0 +1,208 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>מסך הדובר — תרגום חי</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh;
+    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    background: radial-gradient(1000px 500px at 50% -10%, #1b2a4a, #0b1120 55%);
+    color: #e8eefc; padding: 20px; display: flex; justify-content: center;
+  }
+  .wrap { width: 100%; max-width: 560px; }
+  h1 { font-size: 22px; margin: 6px 0 18px; text-align: center; }
+  .panel {
+    background: #111a2e; border: 1px solid #23324f; border-radius: 16px;
+    padding: 18px; margin-bottom: 16px;
+  }
+  label.h { display:block; color:#9fb0d3; font-size:13px; margin-bottom:8px; font-weight:700;}
+  .linkrow { display:flex; gap:8px; }
+  input.link {
+    flex:1; background:#0b1324; border:1px solid #2a3a5c; color:#cfe0ff;
+    border-radius:10px; padding:12px; font-size:13px; direction:ltr; text-align:left;
+  }
+  button {
+    border:0; border-radius:10px; padding:12px 16px; font-size:15px; font-weight:700;
+    cursor:pointer; color:#fff; background:#2563eb; white-space:nowrap;
+  }
+  button.copy { background:#334155; }
+  .mic {
+    width:100%; padding:20px; font-size:19px; border-radius:14px;
+    background:linear-gradient(135deg,#22c55e,#16a34a);
+  }
+  .mic.rec { background:linear-gradient(135deg,#ef4444,#dc2626); }
+  .status { text-align:center; color:#9fb0d3; font-size:13px; margin:12px 0 4px; min-height:18px;}
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:#64748b; margin-inline-start:6px; vertical-align:middle;}
+  .dot.on { background:#22c55e; box-shadow:0 0 10px #22c55e; }
+  .dot.rec { background:#ef4444; box-shadow:0 0 10px #ef4444; animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity:.35; } }
+  #transcript {
+    background:#0b1324; border:1px solid #23324f; border-radius:12px; padding:14px;
+    min-height:120px; max-height:34vh; overflow:auto; line-height:1.7; font-size:16px;
+  }
+  #transcript .seg { padding:4px 0; border-bottom:1px dashed #1e2b46; }
+  #interim { color:#7c8bb0; font-style:italic; }
+  .hint { color:#7c8bb0; font-size:12px; margin-top:8px; line-height:1.5; }
+  .warn {
+    background:#3a1d1d; border:1px solid #6b2b2b; color:#ffd7d7; border-radius:12px;
+    padding:16px; line-height:1.6; font-size:14px;
+  }
+  .warn b { color:#fff; }
+</style>
+<div class="wrap" dir="rtl">
+  <h1>🎙️ מסך הדובר</h1>
+
+  <div class="panel">
+    <label class="h">קישור לצופים — שלח למי שיצפה בתרגום</label>
+    <div class="linkrow">
+      <input class="link" id="viewerLink" readonly>
+      <button class="copy" id="copyBtn">העתק</button>
+    </div>
+    <div class="hint">כל מי שיפתח את הקישור יבחר שפה ויראה את התרגום החי שלך.</div>
+  </div>
+
+  <div id="unsupported" class="panel warn" style="display:none">
+    <b>הדפדפן הזה לא תומך בזיהוי דיבור.</b><br>
+    כדי לשדר בחינם, פתח את הדף הזה ב-<b>Google Chrome</b> על <b>מחשב</b> או על טלפון <b>אנדרואיד</b>.<br>
+    (ב-Safari באייפון זיהוי הדיבור לא נתמך.)
+  </div>
+
+  <div id="controls" class="panel">
+    <button class="mic" id="micBtn">▶️ התחל לדבר</button>
+    <div class="status"><span id="connState">מתחבר…</span> <span class="dot" id="dot"></span></div>
+    <div class="hint">דבר בעברית בקצב טבעי. הזיהוי מתבצע חינם בדפדפן, והתרגום נשלח לצופים אחרי כל משפט.</div>
+  </div>
+
+  <div class="panel">
+    <label class="h">מה שנקלט (עברית)</label>
+    <div id="transcript"><span id="interim"></span></div>
+  </div>
+</div>
+
+<script>
+const params = new URLSearchParams(location.search);
+const sessionId = params.get('s');
+const token = params.get('t');
+
+if (!sessionId || !token) {
+  document.body.innerHTML = '<p style="margin:auto;text-align:center">קישור שידור לא תקין. חזור לדף הבית והתחל שידור חדש.</p>';
+}
+
+const viewerUrl = `${location.origin}/watch.html?s=${encodeURIComponent(sessionId)}`;
+document.getElementById('viewerLink').value = viewerUrl;
+document.getElementById('copyBtn').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(viewerUrl); } catch {}
+  const b = document.getElementById('copyBtn');
+  b.textContent = 'הועתק ✓';
+  setTimeout(() => (b.textContent = 'העתק'), 1500);
+});
+
+const dot = document.getElementById('dot');
+const connState = document.getElementById('connState');
+const micBtn = document.getElementById('micBtn');
+const transcriptEl = document.getElementById('transcript');
+const interimEl = document.getElementById('interim');
+
+// ---- WebSocket to server (send recognized Hebrew text) ----
+const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+const wsUrl = `${wsProto}://${location.host}/ws/speak?s=${encodeURIComponent(sessionId)}&t=${encodeURIComponent(token)}`;
+let ws = null, wsOpen = false;
+function connect() {
+  ws = new WebSocket(wsUrl);
+  ws.onopen = () => { wsOpen = true; setConn('מחובר — מוכן לשידור', 'on'); };
+  ws.onclose = () => { wsOpen = false; setConn('החיבור נסגר — מנסה שוב…', ''); setTimeout(connect, 1500); };
+  ws.onerror = () => {};
+  ws.onmessage = (ev) => {
+    try {
+      const m = JSON.parse(ev.data);
+      if (m.type === 'error') setConn('שגיאה: ' + m.message, '');
+    } catch {}
+  };
+}
+function setConn(text, state) {
+  connState.textContent = text;
+  dot.className = 'dot' + (recording ? ' rec' : (state ? ' ' + state : ''));
+}
+function sendText(text) {
+  if (wsOpen && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'text', text }));
+  }
+}
+function addSegment(text) {
+  const div = document.createElement('div');
+  div.className = 'seg';
+  div.textContent = text;
+  transcriptEl.insertBefore(div, interimEl);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+// ---- Web Speech API (free, in-browser Hebrew recognition) ----
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognition = null;
+let recording = false;
+
+if (!SR) {
+  document.getElementById('unsupported').style.display = 'block';
+  document.getElementById('controls').style.display = 'none';
+} else {
+  connect();
+  micBtn.addEventListener('click', () => (recording ? stop() : start()));
+}
+
+function buildRecognition() {
+  const rec = new SR();
+  rec.lang = 'he-IL';
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.maxAlternatives = 1;
+
+  rec.onresult = (e) => {
+    let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      const txt = r[0].transcript;
+      if (r.isFinal) {
+        const clean = txt.trim();
+        if (clean) { addSegment(clean); sendText(clean); }
+      } else {
+        interim += txt;
+      }
+    }
+    interimEl.textContent = interim;
+  };
+  rec.onerror = (e) => {
+    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+      alert('הגישה למיקרופון נחסמה. אשר גישה בהגדרות הדפדפן ונסה שוב.');
+      stop();
+    } else if (e.error === 'no-speech') {
+      // ignore; onend will restart
+    }
+  };
+  rec.onend = () => {
+    // Chrome stops after silence/timeout; restart while still recording.
+    if (recording) { try { rec.start(); } catch {} }
+  };
+  return rec;
+}
+
+function start() {
+  recognition = buildRecognition();
+  recording = true;
+  try { recognition.start(); } catch {}
+  micBtn.textContent = '⏹️ עצור';
+  micBtn.classList.add('rec');
+  setConn(wsOpen ? 'מקשיב ומשדר…' : 'מתחבר…', 'on');
+}
+
+function stop() {
+  recording = false;
+  interimEl.textContent = '';
+  try { recognition && recognition.stop(); } catch {}
+  micBtn.textContent = '▶️ התחל לדבר';
+  micBtn.classList.remove('rec');
+  setConn('מחובר — השידור מושהה', 'on');
+}
+
+window.addEventListener('beforeunload', () => { if (recording) stop(); });
+</script>

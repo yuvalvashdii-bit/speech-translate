@@ -1,0 +1,57 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>תרגום חי בשידור</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    background: radial-gradient(1200px 600px at 50% -10%, #1b2a4a, #0b1120 60%);
+    color: #e8eefc; padding: 24px;
+  }
+  .card {
+    width: 100%; max-width: 460px; background: #111a2e;
+    border: 1px solid #23324f; border-radius: 20px; padding: 32px 28px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.5); text-align: center;
+  }
+  h1 { font-size: 26px; margin: 0 0 6px; }
+  p.sub { color: #94a3c4; margin: 0 0 26px; line-height: 1.5; }
+  button {
+    width: 100%; border: 0; border-radius: 12px; padding: 16px;
+    font-size: 17px; font-weight: 700; cursor: pointer;
+    background: linear-gradient(135deg, #3b82f6, #2563eb); color: #fff;
+    transition: transform .1s ease, filter .2s ease;
+  }
+  button:hover { filter: brightness(1.08); }
+  button:active { transform: scale(.98); }
+  .steps { text-align: right; margin-top: 26px; color: #9fb0d3; font-size: 14px; line-height: 1.8; }
+  .steps b { color: #cfe0ff; }
+  .logo { font-size: 40px; margin-bottom: 8px; }
+</style>
+<div class="card" dir="rtl">
+  <div class="logo">🎙️🌍</div>
+  <h1>תרגום חי בשידור</h1>
+  <p class="sub">דבר בעברית — הצופים רואים את התרגום בזמן אמת בשפה שהם בוחרים.</p>
+  <button id="start">התחל שידור חדש</button>
+  <div class="steps">
+    <div><b>1.</b> לחץ "התחל שידור" — ייפתח מסך הדובר.</div>
+    <div><b>2.</b> העתק את קישור הצופים ושלח למי שצריך.</div>
+    <div><b>3.</b> לחץ "התחל להקליט" ודבר. הצופים בוחרים שפה ורואים תרגום חי.</div>
+  </div>
+</div>
+<script>
+  document.getElementById('start').addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    e.target.textContent = 'יוצר שידור…';
+    try {
+      const r = await fetch('/api/session', { method: 'POST' });
+      const { sessionId, token } = await r.json();
+      location.href = `/speaker.html?s=${encodeURIComponent(sessionId)}&t=${encodeURIComponent(token)}`;
+    } catch (err) {
+      alert('שגיאה ביצירת שידור. נסה שוב.');
+      e.target.disabled = false;
+      e.target.textContent = 'התחל שידור חדש';
+    }
+  });
+</script>
