@@ -18,16 +18,51 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = process.env.PORT || 3000;
 const SOURCE_LANG = process.env.SOURCE_LANG || 'he'; // language the speaker talks in
-const TRANSLATION_ENGINE = (process.env.TRANSLATION_ENGINE || 'free').toLowerCase(); // free | openai | deepl
+const TRANSLATION_ENGINE = (process.env.TRANSLATION_ENGINE || 'free').toLowerCase(); // free | claude | openai | deepl
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const TRANSLATE_MODEL = process.env.TRANSLATE_MODEL || 'gpt-4o-mini';
 const DEEPL_API_KEY = process.env.DEEPL_API_KEY;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-haiku-4-5'; // fast + cheap, good for live
 
+// Context handed to the quality (LLM) engine so it picks the right register + terms.
+const TALK_CONTEXT = process.env.TALK_CONTEXT ||
+  'A company CEO is speaking to employees at an informal happy-hour gathering about ' +
+  'the quarter\'s business results and the work happening at the companies "ATM" and "Steerlinq". ' +
+  'The audience is the company\'s Russian- and English-speaking employees. ' +
+  'Keep the company names ATM and Steerlinq in Latin letters. ' +
+  'Use natural, warm-but-professional workplace language appropriate for staff.';
+
+// Which engine (if any) is a paid, context-aware "quality" engine that needs a key.
+function premiumEngine() {
+  if (TRANSLATION_ENGINE === 'claude' && ANTHROPIC_API_KEY) return 'claude';
+  if (TRANSLATION_ENGINE === 'openai' && OPENAI_API_KEY) return 'openai';
+  if (TRANSLATION_ENGINE === 'deepl' && DEEPL_API_KEY) return 'deepl';
+  return null;
+}
+
+if (TRANSLATION_ENGINE === 'claude' && !ANTHROPIC_API_KEY) {
+  console.warn('\n[!] TRANSLATION_ENGINE=claude but ANTHROPIC_API_KEY is not set.\n');
+}
 if (TRANSLATION_ENGINE === 'openai' && !OPENAI_API_KEY) {
   console.warn('\n[!] TRANSLATION_ENGINE=openai but OPENAI_API_KEY is not set.\n');
 }
 if (TRANSLATION_ENGINE === 'deepl' && !DEEPL_API_KEY) {
   console.warn('\n[!] TRANSLATION_ENGINE=deepl but DEEPL_API_KEY is not set.\n');
+}
+
+// ---- Glossary: normalize company names / known terms in the Hebrew BEFORE translating,
+// so every engine keeps them correct (and mis-hearings get fixed). Edit freely. ----
+const GLOSSARY = [
+  { re: /א\.\s?צ\.\s?מ/g, to: 'ATM' },              // א.צ.מ
+  { re: /אצ["'״׳]?מ/g, to: 'ATM' },                 // אצמ / אצ"מ / אצ׳מ
+  { re: /\bATM\b/gi, to: 'ATM' },
+  { re: /ס[טת][יי]?[רר]?לינ[קגכ]|סטרלינ[קגכ]/g, to: 'Steerlinq' }, // סטירלינק / סטרלינג …
+  { re: /steer\s*lin[qgk]/gi, to: 'Steerlinq' },
+];
+function applyGlossary(t) {
+  for (const { re, to } of GLOSSARY) t = t.replace(re, to);
+  return t;
 }
 
 // ---- Language catalog (code -> display name). Russian first (priority). ----
@@ -112,6 +147,33 @@ async function translateMyMemory(text, targetCode) {
   return data.responseData?.translatedText || text;
 }
 
+// Quality engine: context-aware translation via Claude (fast Haiku model).
+async function translateClaude(text, targetName) {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens: 512,
+      system:
+        `You are a professional simultaneous interpreter at a company event. Context: ${TALK_CONTEXT}\n` +
+        `Translate the Hebrew the user sends into ${targetName}. ` +
+        `Output ONLY the translation — no notes, no quotes, no transliteration, no explanation. ` +
+        `Keep the company names ATM and Steerlinq unchanged. Preserve names, numbers, and tone, ` +
+        `and use natural ${targetName} suited to employees hearing their CEO.`,
+      messages: [{ role: 'user', content: text }],
+    }),
+  });
+  if (!res.ok) throw new Error(`claude ${res.status}`);
+  const data = await res.json();
+  const block = (data.content || []).find((b) => b.type === 'text');
+  return (block?.text || '').trim();
+}
+
 async function translateOpenAI(text, targetName) {
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
@@ -154,28 +216,66 @@ async function translateDeepL(text, targetCode) {
   return (data.translations?.[0]?.text || '').trim();
 }
 
-async function translate(text, langCode) {
-  if (langCode === SOURCE_LANG) return text; // no translation needed
-  const key = `${langCode}::${text}`;
-  if (translateCache.has(key)) return translateCache.get(key);
+// Names that must survive translation verbatim (derived from the glossary targets).
+const PROTECT_TERMS = [...new Set(GLOSSARY.map((g) => g.to))];
+// Swap protected names for inert placeholders the translator won't touch, then restore.
+function protectTerms(text) {
+  const map = [];
+  let t = text;
+  PROTECT_TERMS.forEach((term, i) => {
+    const re = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
+    if (re.test(t)) {
+      const ph = `QZX${i}XZQ`; // rare token; engines pass it through unchanged
+      t = t.replace(re, ph);
+      map.push([i, term]);
+    }
+  });
+  return { t, map };
+}
+function restoreTerms(text, map) {
+  for (const [i, term] of map) {
+    // tolerate case changes / stray spaces the engine might introduce
+    const re = new RegExp(`Q\\s*Z\\s*X\\s*${i}\\s*X\\s*Z\\s*Q`, 'gi');
+    text = text.replace(re, term);
+  }
+  return text;
+}
 
+async function translateFree(text, langCode) {
+  const { t, map } = protectTerms(text);
   let out;
   try {
-    if (TRANSLATION_ENGINE === 'openai' && OPENAI_API_KEY) {
-      out = await translateOpenAI(text, LANGUAGES[langCode] || langCode);
-    } else if (TRANSLATION_ENGINE === 'deepl' && DEEPL_API_KEY) {
-      out = await translateDeepL(text, langCode);
-    } else {
-      // FREE (default): Google first, MyMemory fallback.
-      try {
-        out = await translateGoogleFree(text, langCode);
-      } catch (e1) {
-        out = await translateMyMemory(text, langCode);
-      }
-    }
+    out = await translateGoogleFree(t, langCode);
+  } catch (e1) {
+    out = await translateMyMemory(t, langCode);
+  }
+  return restoreTerms(out, map);
+}
+
+// isFinal=true uses the paid quality engine (if configured); live partials stay on the
+// fast free engine. So the mid-speech preview is quick, and the locked line is polished.
+async function translate(text, langCode, isFinal) {
+  if (langCode === SOURCE_LANG) return text; // no translation needed
+  const engine = premiumEngine();
+  const usePremium = isFinal && !!engine;
+  const key = `${usePremium ? 'q' : 'f'}:${langCode}::${text}`;
+  if (translateCache.has(key)) return translateCache.get(key);
+
+  const name = LANGUAGES[langCode] || langCode;
+  let out;
+  try {
+    if (usePremium && engine === 'claude') out = await translateClaude(text, name);
+    else if (usePremium && engine === 'openai') out = await translateOpenAI(text, name);
+    else if (usePremium && engine === 'deepl') out = await translateDeepL(text, langCode);
+    else out = await translateFree(text, langCode);
   } catch (e) {
-    console.error(`translate(${langCode}) error:`, e.message);
-    return null;
+    console.error(`translate(${langCode}${usePremium ? ',quality' : ''}) error:`, e.message);
+    // If the paid engine fails, fall back to free so viewers still get text.
+    try {
+      out = await translateFree(text, langCode);
+    } catch (e2) {
+      return null;
+    }
   }
 
   if (translateCache.size > 5000) translateCache.clear();
@@ -188,7 +288,7 @@ async function translate(text, langCode) {
 //   isFinal=false -> live partial (mid-speech), viewers update the SAME line by id.
 //   isFinal=true  -> the sentence is done; viewers lock that line.
 async function handleText(session, msg) {
-  const hebrew = (msg.text || '').trim();
+  const hebrew = applyGlossary((msg.text || '').trim());
   if (hebrew.length < 1) return;
 
   const isFinal = !!msg.isFinal;
@@ -205,7 +305,7 @@ async function handleText(session, msg) {
   const translations = {};
   await Promise.all(
     [...wanted].map(async (lang) => {
-      translations[lang] = await translate(hebrew, lang);
+      translations[lang] = await translate(hebrew, lang, isFinal);
     })
   );
 
@@ -294,9 +394,11 @@ wss.on('connection', (ws, req, url) => {
 });
 
 server.listen(PORT, () => {
-  const engine = TRANSLATION_ENGINE === 'openai' && OPENAI_API_KEY ? `OpenAI(${TRANSLATE_MODEL})`
-    : TRANSLATION_ENGINE === 'deepl' && DEEPL_API_KEY ? 'DeepL'
+  const eng = premiumEngine();
+  const engine = eng === 'claude' ? `Claude(${CLAUDE_MODEL}) on finals + free on partials`
+    : eng === 'openai' ? `OpenAI(${TRANSLATE_MODEL}) on finals + free on partials`
+    : eng === 'deepl' ? 'DeepL on finals + free on partials'
     : 'FREE (Google/MyMemory, no key)';
   console.log(`\nLive translation server on http://localhost:${PORT}`);
-  console.log(`Source=${SOURCE_LANG}  Translate=${engine}  STT=browser (Web Speech API, free)\n`);
+  console.log(`Source=${SOURCE_LANG}  Translate=${engine}  STT=browser (Web Speech API, free)  Glossary=${GLOSSARY.length} terms\n`);
 });
